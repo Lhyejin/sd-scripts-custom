@@ -518,6 +518,7 @@ def generate_dataset_group_by_blueprint(dataset_group_blueprint: DatasetGroupBlu
                     f"""\
         [Subset {j} of Dataset {i}]
           image_dir: "{subset.image_dir}"
+          conditioning_data_dir: "{subset.conditioning_data_dir}"
           image_count: {subset.img_count}
           num_repeats: {subset.num_repeats}
           shuffle_caption: {subset.shuffle_caption}
@@ -616,9 +617,12 @@ def generate_dreambooth_subsets_config_by_subdirs(train_data_dir: Optional[str] 
 
 
 def generate_controlnet_subsets_config_by_subdirs(
-    train_data_dir: Optional[str] = None, conditioning_data_dir: Optional[str] = None, caption_extension: str = ".txt"
+    train_data_dir: Optional[str] = None, 
+    conditioning_data_dir: Optional[str] = None, 
+    caption_extension: str = ".txt",
+    reg_data_dir: Optional[str] = None
 ):
-    def generate(base_dir: Optional[str]):
+    def generate(base_dir: Optional[str], is_reg: bool = None):
         if base_dir is None:
             return []
 
@@ -639,6 +643,7 @@ def generate_controlnet_subsets_config_by_subdirs(
 
     subsets_config = []
     subsets_config += generate(train_data_dir)
+    subsets_config += generate(reg_data_dir)
 
     return subsets_config
 

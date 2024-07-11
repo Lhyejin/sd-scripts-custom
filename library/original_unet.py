@@ -1369,7 +1369,7 @@ def get_up_block(
             upcast_attention=upcast_attention,
         )
 
-
+# NOTE(Hyejin): sd1.5버전의 unet은 이부분에서 controlnet feature를 받고 있음
 class UNet2DConditionModel(nn.Module):
     _supports_gradient_checkpointing = True
 

@@ -1,3 +1,4 @@
+import argparse
 import importlib
 import argparse
 import math
@@ -8,20 +9,33 @@ import time
 import json
 from multiprocessing import Value
 import toml
-
 from tqdm import tqdm
-
 import torch
 from library.device_utils import init_ipex, clean_memory_on_device
 
-init_ipex()
+from torch.nn.parallel import DistributedDataParallel as DDP
+from types import SimpleNamespace
+from diffusers.configuration_utils import FrozenDict
 
+try:
+    import intel_extension_for_pytorch as ipex
+
+    if torch.xpu.is_available():
+        from library.ipex import ipex_init
+
+        ipex_init()
+except Exception:
+    pass
 from accelerate.utils import set_seed
 from diffusers import DDPMScheduler, ControlNetModel
-from library import deepspeed_utils, model_util
+from safetensors.torch import load_file
+
+from library import model_util
 
 import library.train_util as train_util
-from library.train_util import DreamBoothDataset
+from library.train_util import (
+    DreamBoothDataset,
+)
 import library.config_util as config_util
 from library.config_util import (
     ConfigSanitizer,
@@ -36,8 +50,9 @@ from library.custom_train_functions import (
     scale_v_prediction_loss_like_noise_prediction,
     add_v_prediction_like_loss,
     apply_debiased_estimation,
-    apply_masked_loss,
 )
+
+from library import deepspeed_utils
 from library.utils import setup_logging, add_logging_arguments
 
 setup_logging()
@@ -46,93 +61,204 @@ import logging
 logger = logging.getLogger(__name__)
 
 
-class NetworkTrainer:
+try:
+    import intel_extension_for_pytorch as ipex
+
+    if torch.xpu.is_available():
+        from library.ipex import ipex_init
+
+        ipex_init()
+except Exception:
+    pass
+from library import sdxl_model_util, sdxl_train_util, train_util
+import train_network_with_controlnet as train_network
+
+
+class SdxlNetworkTrainer(train_network.NetworkTrainer):
     def __init__(self):
-        self.vae_scale_factor = 0.18215
-        self.is_sdxl = False
-
-    # TODO 他のスクリプトと共通化する
-    def generate_step_logs(
-        self, args: argparse.Namespace, current_loss, avr_loss, lr_scheduler, keys_scaled=None, mean_norm=None, maximum_norm=None
-    ):
-        logs = {"loss/current": current_loss, "loss/average": avr_loss}
-
-        if keys_scaled is not None:
-            logs["max_norm/keys_scaled"] = keys_scaled
-            logs["max_norm/average_key_norm"] = mean_norm
-            logs["max_norm/max_key_norm"] = maximum_norm
-
-        lrs = lr_scheduler.get_last_lr()
-
-        if args.network_train_text_encoder_only or len(lrs) <= 2:  # not block lr (or single block)
-            if args.network_train_unet_only:
-                logs["lr/unet"] = float(lrs[0])
-            elif args.network_train_text_encoder_only:
-                logs["lr/textencoder"] = float(lrs[0])
-            else:
-                logs["lr/textencoder"] = float(lrs[0])
-                logs["lr/unet"] = float(lrs[-1])  # may be same to textencoder
-
-            if (
-                args.optimizer_type.lower().startswith("DAdapt".lower()) or args.optimizer_type.lower() == "Prodigy".lower()
-            ):  # tracking d*lr value of unet.
-                logs["lr/d*lr"] = (
-                    lr_scheduler.optimizers[-1].param_groups[0]["d"] * lr_scheduler.optimizers[-1].param_groups[0]["lr"]
-                )
-        else:
-            idx = 0
-            if not args.network_train_unet_only:
-                logs["lr/textencoder"] = float(lrs[0])
-                idx = 1
-
-            for i in range(idx, len(lrs)):
-                logs[f"lr/group{i}"] = float(lrs[i])
-                if args.optimizer_type.lower().startswith("DAdapt".lower()) or args.optimizer_type.lower() == "Prodigy".lower():
-                    logs[f"lr/d*lr/group{i}"] = (
-                        lr_scheduler.optimizers[-1].param_groups[i]["d"] * lr_scheduler.optimizers[-1].param_groups[i]["lr"]
-                    )
-
-        return logs
+        super().__init__()
+        self.vae_scale_factor = sdxl_model_util.VAE_SCALE_FACTOR
+        self.is_sdxl = True
 
     def assert_extra_args(self, args, train_dataset_group):
-        pass
+        super().assert_extra_args(args, train_dataset_group)
+        sdxl_train_util.verify_sdxl_training_args(args)
+
+        if args.cache_text_encoder_outputs:
+            assert (
+                train_dataset_group.is_text_encoder_output_cacheable()
+            ), "when caching Text Encoder output, either caption_dropout_rate, shuffle_caption, token_warmup_step or caption_tag_dropout_rate cannot be used / Text Encoderの出力をキャッシュするときはcaption_dropout_rate, shuffle_caption, token_warmup_step, caption_tag_dropout_rateは使えません"
+
+        assert (
+            args.network_train_unet_only or not args.cache_text_encoder_outputs
+        ), "network for Text Encoder cannot be trained with caching Text Encoder outputs / Text Encoderの出力をキャッシュしながらText Encoderのネットワークを学習することはできません"
+
+        train_dataset_group.verify_bucket_reso_steps(32)
 
     def load_target_model(self, args, weight_dtype, accelerator):
-        text_encoder, vae, unet, _ = train_util.load_target_model(args, weight_dtype, accelerator)
-        return model_util.get_model_version_str_for_sd1_sd2(args.v2, args.v_parameterization), text_encoder, vae, unet
+        (
+            load_stable_diffusion_format,
+            text_encoder1,
+            text_encoder2,
+            vae,
+            unet,
+            logit_scale,
+            ckpt_info,
+        ) = sdxl_train_util.load_target_model(args, accelerator, sdxl_model_util.MODEL_VERSION_SDXL_BASE_V1_0, weight_dtype)
+
+        self.load_stable_diffusion_format = load_stable_diffusion_format
+        self.logit_scale = logit_scale
+        self.ckpt_info = ckpt_info
+
+        return sdxl_model_util.MODEL_VERSION_SDXL_BASE_V1_0, [text_encoder1, text_encoder2], vae, unet
 
     def load_tokenizer(self, args):
-        tokenizer = train_util.load_tokenizer(args)
+        tokenizer = sdxl_train_util.load_tokenizers(args)
         return tokenizer
 
     def is_text_encoder_outputs_cached(self, args):
-        return False
-
-    def is_train_text_encoder(self, args):
-        return not args.network_train_unet_only and not self.is_text_encoder_outputs_cached(args)
+        return args.cache_text_encoder_outputs
 
     def cache_text_encoder_outputs_if_needed(
-        self, args, accelerator, unet, vae, tokenizers, text_encoders, data_loader, weight_dtype
+        self, args, accelerator, unet, vae, tokenizers, text_encoders, dataset: train_util.DatasetGroup, weight_dtype
     ):
-        for t_enc in text_encoders:
-            t_enc.to(accelerator.device, dtype=weight_dtype)
+        if args.cache_text_encoder_outputs:
+            if not args.lowram:
+                # メモリ消費を減らす
+                print("move vae and unet to cpu to save memory")
+                org_vae_device = vae.device
+                org_unet_device = unet.device
+                vae.to("cpu")
+                unet.to("cpu")
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+
+            # When TE is not be trained, it will not be prepared so we need to use explicit autocast
+            with accelerator.autocast():
+                dataset.cache_text_encoder_outputs(
+                    tokenizers,
+                    text_encoders,
+                    accelerator.device,
+                    weight_dtype,
+                    args.cache_text_encoder_outputs_to_disk,
+                    accelerator.is_main_process,
+                )
+
+            text_encoders[0].to("cpu", dtype=torch.float32)  # Text Encoder doesn't work with fp16 on CPU
+            text_encoders[1].to("cpu", dtype=torch.float32)
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+
+            if not args.lowram:
+                print("move vae and unet back to original device")
+                vae.to(org_vae_device)
+                unet.to(org_unet_device)
+        else:
+            # Text Encoderから毎回出力を取得するので、GPUに乗せておく
+            text_encoders[0].to(accelerator.device)
+            text_encoders[1].to(accelerator.device)
 
     def get_text_cond(self, args, accelerator, batch, tokenizers, text_encoders, weight_dtype):
-        input_ids = batch["input_ids"].to(accelerator.device)
-        encoder_hidden_states = train_util.get_hidden_states(args, input_ids, tokenizers[0], text_encoders[0], weight_dtype)
-        return encoder_hidden_states
+        if "text_encoder_outputs1_list" not in batch or batch["text_encoder_outputs1_list"] is None:
+            input_ids1 = batch["input_ids"]
+            input_ids2 = batch["input_ids2"]
+            with torch.enable_grad():
+                # Get the text embedding for conditioning
+                # TODO support weighted captions
+                # if args.weighted_captions:
+                #     encoder_hidden_states = get_weighted_text_embeddings(
+                #         tokenizer,
+                #         text_encoder,
+                #         batch["captions"],
+                #         accelerator.device,
+                #         args.max_token_length // 75 if args.max_token_length else 1,
+                #         clip_skip=args.clip_skip,
+                #     )
+                # else:
+                input_ids1 = input_ids1.to(accelerator.device)
+                input_ids2 = input_ids2.to(accelerator.device)
+                encoder_hidden_states1, encoder_hidden_states2, pool2 = train_util.get_hidden_states_sdxl(
+                    args.max_token_length,
+                    input_ids1,
+                    input_ids2,
+                    tokenizers[0],
+                    tokenizers[1],
+                    text_encoders[0],
+                    text_encoders[1],
+                    None if not args.full_fp16 else weight_dtype,
+                    accelerator=accelerator,
+                )
+        else:
+            encoder_hidden_states1 = batch["text_encoder_outputs1_list"].to(accelerator.device).to(weight_dtype)
+            encoder_hidden_states2 = batch["text_encoder_outputs2_list"].to(accelerator.device).to(weight_dtype)
+            pool2 = batch["text_encoder_pool2_list"].to(accelerator.device).to(weight_dtype)
 
-    def call_unet(self, args, accelerator, unet, noisy_latents, timesteps, text_conds, batch, weight_dtype):
-        noise_pred = unet(noisy_latents, timesteps, text_conds).sample
+            # # verify that the text encoder outputs are correct
+            # ehs1, ehs2, p2 = train_util.get_hidden_states_sdxl(
+            #     args.max_token_length,
+            #     batch["input_ids"].to(text_encoders[0].device),
+            #     batch["input_ids2"].to(text_encoders[0].device),
+            #     tokenizers[0],
+            #     tokenizers[1],
+            #     text_encoders[0],
+            #     text_encoders[1],
+            #     None if not args.full_fp16 else weight_dtype,
+            # )
+            # b_size = encoder_hidden_states1.shape[0]
+            # assert ((encoder_hidden_states1.to("cpu") - ehs1.to(dtype=weight_dtype)).abs().max() > 1e-2).sum() <= b_size * 2
+            # assert ((encoder_hidden_states2.to("cpu") - ehs2.to(dtype=weight_dtype)).abs().max() > 1e-2).sum() <= b_size * 2
+            # assert ((pool2.to("cpu") - p2.to(dtype=weight_dtype)).abs().max() > 1e-2).sum() <= b_size * 2
+            # print("text encoder outputs verified")
+
+        return encoder_hidden_states1, encoder_hidden_states2, pool2
+
+    def call_unet(self, args, accelerator, unet, noisy_latents, timesteps, text_conds, batch, weight_dtype, down_block_res_samples=None, mid_block_res_sample=None):
+        noisy_latents = noisy_latents.to(weight_dtype)  # TODO check why noisy_latents is not weight_dtype
+
+        # get size embeddings
+        orig_size = batch["original_sizes_hw"]
+        crop_size = batch["crop_top_lefts"]
+        target_size = batch["target_sizes_hw"]
+        embs = sdxl_train_util.get_size_embeddings(orig_size, crop_size, target_size, accelerator.device).to(weight_dtype)
+
+        # concat embeddings
+        encoder_hidden_states1, encoder_hidden_states2, pool2 = text_conds
+        vector_embedding = torch.cat([pool2, embs], dim=1).to(weight_dtype)
+        text_embedding = torch.cat([encoder_hidden_states1, encoder_hidden_states2], dim=2).to(weight_dtype)
+
+        # NOTE(hyejin): prediction unet + controlnet feature in call_unet
+        noise_pred = unet(noisy_latents, 
+                          timesteps, 
+                          text_embedding, 
+                          vector_embedding, 
+                          down_block_res_samples=down_block_res_samples, 
+                          mid_block_res_sample=mid_block_res_sample.to(dtype=weight_dtype))
+        
         return noise_pred
 
-    def all_reduce_network(self, accelerator, network):
-        for param in network.parameters():
-            if param.grad is not None:
-                param.grad = accelerator.reduce(param.grad, reduction="mean")
-
     def sample_images(self, accelerator, args, epoch, global_step, device, vae, tokenizer, text_encoder, unet):
-        train_util.sample_images(accelerator, args, epoch, global_step, device, vae, tokenizer, text_encoder, unet)
+        sdxl_train_util.sample_images(accelerator, args, epoch, global_step, device, vae, tokenizer, text_encoder, unet)
+
+    # NOTE(hyejin): controlnet의 controlnet_added_cond_kwargs를 위한 함수
+    # https://github.com/huggingface/diffusers/blob/main/src/diffusers/pipelines/controlnet/pipeline_controlnet_sd_xl.py#L1468C21-L1468C50
+    def _get_add_time_ids(self, original_size, crops_coords_top_left, target_size, dtype, text_encoder_projection_dim=None, addition_time_embed_dim=256):
+        
+        # 기존 코드의 type은 PIL.Image.Image이기 때문에 6이 됨
+        # 밑에꺼는 텐서 계산이 되어버림
+        add_time_ids = list(original_size) + list(crops_coords_top_left) + list(target_size)
+        passed_add_embed_dim = (
+            addition_time_embed_dim * len(add_time_ids) + text_encoder_projection_dim
+        )
+        expected_add_embed_dim = 2816
+        # expected_add_embed_dim = unet.add_embedding.linear_1.in_features
+        # print("expected_add_embed_dim:", expected_add_embed_dim)
+        if expected_add_embed_dim != passed_add_embed_dim:
+            raise ValueError(
+                f"Model expects an added time embedding vector of length {expected_add_embed_dim}, but a vector of {passed_add_embed_dim} was created. The model has an incorrect config. Please check `unet.config.time_embedding_type` and `text_encoder_2.config.projection_dim`."
+            )
+
+        add_time_ids = torch.tensor([add_time_ids], dtype=dtype)
+        return add_time_ids
 
     def train(self, args):
         session_id = random.randint(0, 2**32)
@@ -156,7 +282,7 @@ class NetworkTrainer:
 
         # データセットを準備する
         if args.dataset_class is None:
-            blueprint_generator = BlueprintGenerator(ConfigSanitizer(True, True, args.masked_loss, True))
+            blueprint_generator = BlueprintGenerator(ConfigSanitizer(True, False, True, True))
             if use_user_config:
                 logger.info(f"Loading dataset config from {args.dataset_config}")
                 user_config = config_util.load_user_config(args.dataset_config)
@@ -173,8 +299,10 @@ class NetworkTrainer:
                     user_config = {
                         "datasets": [
                             {
-                                "subsets": config_util.generate_dreambooth_subsets_config_by_subdirs(
-                                    args.train_data_dir, args.reg_data_dir
+                                "subsets": config_util.generate_controlnet_subsets_config_by_subdirs(
+                                    train_data_dir=args.train_data_dir, 
+                                    conditioning_data_dir=args.conditioning_data_dir,
+                                    caption_extension=args.caption_extension,
                                 )
                             }
                         ]
@@ -187,7 +315,7 @@ class NetworkTrainer:
                                 "subsets": [
                                     {
                                         "image_dir": args.train_data_dir,
-                                        "metadata_file": args.in_json,
+                                        "conditioning_data_dir": args.conditioning_data_dir
                                     }
                                 ]
                             }
@@ -199,7 +327,6 @@ class NetworkTrainer:
         else:
             # use arbitrary dataset class
             train_dataset_group = train_util.load_arbitrary_dataset(args, tokenizer)
-
         current_epoch = Value("i", 0)
         current_step = Value("i", 0)
         ds_for_collator = train_dataset_group if args.max_data_loader_n_workers == 0 else None
@@ -232,6 +359,110 @@ class NetworkTrainer:
 
         # モデルを読み込む
         model_version, text_encoder, vae, unet = self.load_target_model(args, weight_dtype, accelerator)
+
+        # NOTE:(hyejin) controlnet 추가
+        logger.info("-----------------Controlnet Load하는 부분-------------------------------")
+        if args.v2:
+            unet.config = {
+                "act_fn": "silu",
+                "attention_head_dim": [5, 10, 20, 20],
+                "block_out_channels": [320, 640, 1280, 1280],
+                "center_input_sample": False,
+                "cross_attention_dim": 1024,
+                "down_block_types": ["CrossAttnDownBlock2D", "CrossAttnDownBlock2D", "CrossAttnDownBlock2D", "DownBlock2D"],
+                "downsample_padding": 1,
+                "dual_cross_attention": False,
+                "flip_sin_to_cos": True,
+                "freq_shift": 0,
+                "in_channels": 4,
+                "layers_per_block": 2,
+                "mid_block_scale_factor": 1,
+                "norm_eps": 1e-05,
+                "norm_num_groups": 32,
+                "num_class_embeds": None,
+                "only_cross_attention": False,
+                "out_channels": 4,
+                "sample_size": 96,
+                "up_block_types": ["UpBlock2D", "CrossAttnUpBlock2D", "CrossAttnUpBlock2D", "CrossAttnUpBlock2D"],
+                "use_linear_projection": True,
+                "upcast_attention": True,
+                "only_cross_attention": False,
+                "downsample_padding": 1,
+                "use_linear_projection": True,
+                "class_embed_type": None,
+                "num_class_embeds": None,
+                "resnet_time_scale_shift": "default",
+                "projection_class_embeddings_input_dim": None,
+            }
+        else:
+            unet.config = {
+                'sample_size': 128, 
+                'in_channels': 4, 
+                'out_channels': 4, 
+                'center_input_sample': False, 
+                'flip_sin_to_cos': True, 
+                'freq_shift': 0, 
+                'down_block_types': ['DownBlock2D', 'CrossAttnDownBlock2D', 'CrossAttnDownBlock2D'],
+                'mid_block_type': 'UNetMidBlock2DCrossAttn', 
+                'up_block_types': ['CrossAttnUpBlock2D', 'CrossAttnUpBlock2D', 'UpBlock2D'],
+                'only_cross_attention': False, 
+                'block_out_channels': [320, 640, 1280], 
+                'layers_per_block': 2, 
+                'downsample_padding': 1, 
+                'mid_block_scale_factor': 1, 
+                'dropout': 0.0, 
+                'act_fn': 'silu', 
+                'norm_num_groups': 32, 
+                'norm_eps': 1e-05, 
+                'cross_attention_dim': 2048, 
+                'transformer_layers_per_block': [1, 2, 10], 
+                'reverse_transformer_layers_per_block': None, 
+                'encoder_hid_dim': None, 
+                'encoder_hid_dim_type': None, 
+                'attention_head_dim': [5, 10, 20], 
+                'num_attention_heads': None, 
+                'dual_cross_attention': False, 
+                'use_linear_projection': True, 
+                'class_embed_type': None, 
+                'addition_embed_type': 'text_time', 
+                'addition_time_embed_dim': 256, 
+                'num_class_embeds': None, 
+                'upcast_attention': None, 
+                'resnet_time_scale_shift': 'default', 
+                'resnet_skip_time_act': False, 
+                'resnet_out_scale_factor': 1.0, 
+                'time_embedding_type': 'positional', 
+                'time_embedding_dim': None, 
+                'time_embedding_act_fn': None, 
+                'timestep_post_act': None, 
+                'time_cond_proj_dim': None, 
+                'conv_in_kernel': 3, 
+                'conv_out_kernel': 3,
+                'projection_class_embeddings_input_dim': 2816, 
+                'attention_type': 'default',
+                'class_embeddings_concat': False,
+                'mid_block_only_cross_attention': None,
+                'cross_attention_norm': None, 
+                'addition_embed_type_num_heads': 64, 
+                '_use_default_values': ['reverse_transformer_layers_per_block', 'dropout', 'attention_type'], 
+            }
+        unet.config = FrozenDict(**unet.config)
+
+        # controlnet = ControlNetModel.from_unet(unet)
+        logger.info("controlnet from_unet load")
+        controlnet = None
+        # TODO(hyejin): Controlnet safetensors load하는 부분 구현
+        if args.controlnet_model_name_or_path: 
+            filename = args.controlnet_model_name_or_path
+            if os.path.isfile(filename):
+                if os.path.splitext(filename)[1] == ".safetensors":
+                    state_dict = load_file(filename)
+                else:
+                    state_dict = torch.load(filename)
+                state_dict = model_util.convert_controlnet_state_dict_to_diffusers(state_dict)
+                controlnet.load_state_dict(state_dict)
+            elif os.path.isdir(filename):
+                controlnet = ControlNetModel.from_pretrained(filename, torch_dtype=torch.float16).to(accelerator.device)
 
         # text_encoder is List[CLIPTextModel] or CLIPTextModel
         text_encoders = text_encoder if isinstance(text_encoder, list) else [text_encoder]
@@ -859,8 +1090,38 @@ class NetworkTrainer:
                         for t in text_encoder_conds:
                             t.requires_grad_(True)
 
+                    # NOTE(hyejin): controlnet feature 추가 영역 in training
+                    controlnet_image = batch["conditioning_images"].to(dtype=weight_dtype)
+
+                    
+                    pooled_prompt_embeds = text_encoder_conds[-1]  # pooled_prompt_embeds
+                    add_text_embeds = pooled_prompt_embeds
+
+                    text_encoder_projection_dim = text_encoders[1].config.projection_dim
+                    add_time_ids = self._get_add_time_ids(
+                        original_size=batch["original_sizes_hw"][0],
+                        crops_coords_top_left=batch["crop_top_lefts"][0],
+                        target_size=batch["target_sizes_hw"][0], 
+                        dtype=weight_dtype, 
+                        text_encoder_projection_dim=text_encoder_projection_dim,
+                        addition_time_embed_dim=unet.config.addition_time_embed_dim,
+                    )
+                    add_time_ids = add_time_ids.to(accelerator.device).repeat(add_text_embeds.shape[0], 1)
+                    controlnet_added_cond_kwargs = {"text_embeds": add_text_embeds, "time_ids": add_time_ids}
+                    text_embedding = torch.cat([text_encoder_conds[0], text_encoder_conds[1]], dim=2).to(weight_dtype)
                     # Predict the noise residual
                     with accelerator.autocast():
+                        # NOTE(hyejin): prediction controlnet in training
+                        down_block_res_samples, mid_block_res_sample = controlnet(
+                        noisy_latents,
+                        timesteps,
+                        encoder_hidden_states=text_embedding,
+                        controlnet_cond=controlnet_image,
+                        conditioning_scale=args.conditioning_scale,
+                        added_cond_kwargs=controlnet_added_cond_kwargs,
+                        return_dict=False,
+                        )
+                        
                         noise_pred = self.call_unet(
                             args,
                             accelerator,
@@ -870,6 +1131,8 @@ class NetworkTrainer:
                             text_encoder_conds,
                             batch,
                             weight_dtype,
+                            down_block_res_samples=[sample.to(dtype=weight_dtype) for sample in down_block_res_samples],
+                            mid_block_res_sample=mid_block_res_sample.to(dtype=weight_dtype)
                         )
 
                     if args.v_parameterization:
@@ -1000,107 +1263,8 @@ class NetworkTrainer:
 
 
 def setup_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser()
-
-    add_logging_arguments(parser)
-    train_util.add_sd_models_arguments(parser)
-    train_util.add_dataset_arguments(parser, True, True, True)
-    train_util.add_training_arguments(parser, True)
-    train_util.add_masked_loss_arguments(parser)
-    deepspeed_utils.add_deepspeed_arguments(parser)
-    train_util.add_optimizer_arguments(parser)
-    config_util.add_config_arguments(parser)
-    custom_train_functions.add_custom_train_arguments(parser)
-
-    parser.add_argument(
-        "--no_metadata", action="store_true", help="do not save metadata in output model / メタデータを出力先モデルに保存しない"
-    )
-    parser.add_argument(
-        "--save_model_as",
-        type=str,
-        default="safetensors",
-        choices=[None, "ckpt", "pt", "safetensors"],
-        help="format to save the model (default is .safetensors) / モデル保存時の形式（デフォルトはsafetensors）",
-    )
-
-    parser.add_argument("--unet_lr", type=float, default=None, help="learning rate for U-Net / U-Netの学習率")
-    parser.add_argument("--text_encoder_lr", type=float, default=None, help="learning rate for Text Encoder / Text Encoderの学習率")
-
-    parser.add_argument(
-        "--network_weights", type=str, default=None, help="pretrained weights for network / 学習するネットワークの初期重み"
-    )
-    parser.add_argument(
-        "--network_module", type=str, default=None, help="network module to train / 学習対象のネットワークのモジュール"
-    )
-    parser.add_argument(
-        "--network_dim",
-        type=int,
-        default=None,
-        help="network dimensions (depends on each network) / モジュールの次元数（ネットワークにより定義は異なります）",
-    )
-    parser.add_argument(
-        "--network_alpha",
-        type=float,
-        default=1,
-        help="alpha for LoRA weight scaling, default 1 (same as network_dim for same behavior as old version) / LoRaの重み調整のalpha値、デフォルト1（旧バージョンと同じ動作をするにはnetwork_dimと同じ値を指定）",
-    )
-    parser.add_argument(
-        "--network_dropout",
-        type=float,
-        default=None,
-        help="Drops neurons out of training every step (0 or None is default behavior (no dropout), 1 would drop all neurons) / 訓練時に毎ステップでニューロンをdropする（0またはNoneはdropoutなし、1は全ニューロンをdropout）",
-    )
-    parser.add_argument(
-        "--network_args",
-        type=str,
-        default=None,
-        nargs="*",
-        help="additional arguments for network (key=value) / ネットワークへの追加の引数",
-    )
-    parser.add_argument(
-        "--network_train_unet_only", action="store_true", help="only training U-Net part / U-Net関連部分のみ学習する"
-    )
-    parser.add_argument(
-        "--network_train_text_encoder_only",
-        action="store_true",
-        help="only training Text Encoder part / Text Encoder関連部分のみ学習する",
-    )
-    parser.add_argument(
-        "--training_comment",
-        type=str,
-        default=None,
-        help="arbitrary comment string stored in metadata / メタデータに記録する任意のコメント文字列",
-    )
-    parser.add_argument(
-        "--dim_from_weights",
-        action="store_true",
-        help="automatically determine dim (rank) from network_weights / dim (rank)をnetwork_weightsで指定した重みから自動で決定する",
-    )
-    parser.add_argument(
-        "--scale_weight_norms",
-        type=float,
-        default=None,
-        help="Scale the weight of each key pair to help prevent overtraing via exploding gradients. (1 is a good starting point) / 重みの値をスケーリングして勾配爆発を防ぐ（1が初期値としては適当）",
-    )
-    parser.add_argument(
-        "--base_weights",
-        type=str,
-        default=None,
-        nargs="*",
-        help="network weights to merge into the model before training / 学習前にあらかじめモデルにマージするnetworkの重みファイル",
-    )
-    parser.add_argument(
-        "--base_weights_multiplier",
-        type=float,
-        default=None,
-        nargs="*",
-        help="multiplier for network weights to merge into the model before training / 学習前にあらかじめモデルにマージするnetworkの重みの倍率",
-    )
-    parser.add_argument(
-        "--no_half_vae",
-        action="store_true",
-        help="do not use fp16/bf16 VAE in mixed precision (use float VAE) / mixed precisionでも fp16/bf16 VAEを使わずfloat VAEを使う",
-    )
+    parser = train_network.setup_parser()
+    sdxl_train_util.add_sdxl_training_arguments(parser)
     return parser
 
 
@@ -1108,8 +1272,6 @@ if __name__ == "__main__":
     parser = setup_parser()
 
     args = parser.parse_args()
-    train_util.verify_command_line_training_args(args)
     args = train_util.read_config_from_file(args, parser)
-
-    trainer = NetworkTrainer()
+    trainer = SdxlNetworkTrainer()
     trainer.train(args)

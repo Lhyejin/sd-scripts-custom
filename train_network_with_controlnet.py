@@ -19,6 +19,7 @@ init_ipex()
 from accelerate.utils import set_seed
 from diffusers import DDPMScheduler, ControlNetModel
 from library import deepspeed_utils, model_util
+from safetensors.torch import load_file
 
 import library.train_util as train_util
 from library.train_util import DreamBoothDataset
@@ -39,6 +40,7 @@ from library.custom_train_functions import (
     apply_masked_loss,
 )
 from library.utils import setup_logging, add_logging_arguments
+from types import SimpleNamespace
 
 setup_logging()
 import logging
@@ -232,6 +234,84 @@ class NetworkTrainer:
 
         # モデルを読み込む
         model_version, text_encoder, vae, unet = self.load_target_model(args, weight_dtype, accelerator)
+
+        # NOTE:(hyejin) controlnet 추가
+        logger.info("-----------------Controlnet Load하는 부분-------------------------------")
+        if args.v2:
+            unet.config = {
+                "act_fn": "silu",
+                "attention_head_dim": [5, 10, 20, 20],
+                "block_out_channels": [320, 640, 1280, 1280],
+                "center_input_sample": False,
+                "cross_attention_dim": 1024,
+                "down_block_types": ["CrossAttnDownBlock2D", "CrossAttnDownBlock2D", "CrossAttnDownBlock2D", "DownBlock2D"],
+                "downsample_padding": 1,
+                "dual_cross_attention": False,
+                "flip_sin_to_cos": True,
+                "freq_shift": 0,
+                "in_channels": 4,
+                "layers_per_block": 2,
+                "mid_block_scale_factor": 1,
+                "norm_eps": 1e-05,
+                "norm_num_groups": 32,
+                "num_class_embeds": None,
+                "only_cross_attention": False,
+                "out_channels": 4,
+                "sample_size": 96,
+                "up_block_types": ["UpBlock2D", "CrossAttnUpBlock2D", "CrossAttnUpBlock2D", "CrossAttnUpBlock2D"],
+                "use_linear_projection": True,
+                "upcast_attention": True,
+                "only_cross_attention": False,
+                "downsample_padding": 1,
+                "use_linear_projection": True,
+                "class_embed_type": None,
+                "num_class_embeds": None,
+                "resnet_time_scale_shift": "default",
+                "projection_class_embeddings_input_dim": None,
+            }
+        else:
+            unet.config = {
+                "act_fn": "silu",
+                "attention_head_dim": 8,
+                "block_out_channels": [320, 640, 1280, 1280],
+                "center_input_sample": False,
+                "cross_attention_dim": 768,
+                "down_block_types": ["CrossAttnDownBlock2D", "CrossAttnDownBlock2D", "CrossAttnDownBlock2D", "DownBlock2D"],
+                "downsample_padding": 1,
+                "flip_sin_to_cos": True,
+                "freq_shift": 0,
+                "in_channels": 4,
+                "layers_per_block": 2,
+                "mid_block_scale_factor": 1,
+                "norm_eps": 1e-05,
+                "norm_num_groups": 32,
+                "out_channels": 4,
+                "sample_size": 64,
+                "up_block_types": ["UpBlock2D", "CrossAttnUpBlock2D", "CrossAttnUpBlock2D", "CrossAttnUpBlock2D"],
+                "only_cross_attention": False,
+                "downsample_padding": 1,
+                "use_linear_projection": False,
+                "class_embed_type": None,
+                "num_class_embeds": None,
+                "upcast_attention": False,
+                "resnet_time_scale_shift": "default",
+                "projection_class_embeddings_input_dim": None,
+            }
+        unet.config = SimpleNamespace(**unet.config)
+
+        controlnet = ControlNetModel.from_unet(unet)
+
+        if args.controlnet_model_name_or_path:
+            filename = args.controlnet_model_name_or_path
+            if os.path.isfile(filename):
+                if os.path.splitext(filename)[1] == ".safetensors":
+                    state_dict = load_file(filename)
+                else:
+                    state_dict = torch.load(filename)
+                state_dict = model_util.convert_controlnet_state_dict_to_diffusers(state_dict)
+                controlnet.load_state_dict(state_dict)
+            elif os.path.isdir(filename):
+                controlnet = ControlNetModel.from_pretrained(filename)
 
         # text_encoder is List[CLIPTextModel] or CLIPTextModel
         text_encoders = text_encoder if isinstance(text_encoder, list) else [text_encoder]

@@ -817,7 +817,7 @@ class Upsample2D(nn.Module):
 
         return hidden_states
 
-
+# TODO(hyejin): SDXL에서 controlnet feature를 받고 싶다면 여기 forward 부분에 추가해야함
 class SdxlUNet2DConditionModel(nn.Module):
     _supports_gradient_checkpointing = True
 
@@ -833,6 +833,7 @@ class SdxlUNet2DConditionModel(nn.Module):
         self.time_embed_dim = TIME_EMBED_DIM
         self.adm_in_channels = ADM_IN_CHANNELS
 
+        self.prepare_config()
         self.gradient_checkpointing = False
         # self.sample_size = sample_size
 
@@ -1071,7 +1072,13 @@ class SdxlUNet2DConditionModel(nn.Module):
 
     # endregion
 
-    def forward(self, x, timesteps=None, context=None, y=None, **kwargs):
+    def forward(self, x, 
+                timesteps=None, 
+                context=None, 
+                y=None, 
+                down_block_additional_residuals=None,
+                mid_block_additional_residual=None,
+                **kwargs):
         # broadcast timesteps to batch dimension
         timesteps = timesteps.expand(x.shape[0])
 
@@ -1103,8 +1110,18 @@ class SdxlUNet2DConditionModel(nn.Module):
         for module in self.input_blocks:
             h = call_module(module, h, emb, context)
             hs.append(h)
+        
+        # NOTE(hyejin): skip-connection Controlnet
+        if down_block_additional_residuals is not None:
+            for i in range(len(hs)):
+                hs[i] += down_block_additional_residuals[i]
+            
 
         h = call_module(self.middle_block, h, emb, context)
+
+        # NOTE(hyejin): skip-connection Controlnet
+        if mid_block_additional_residual is not None:
+            h += mid_block_additional_residual
 
         for module in self.output_blocks:
             h = torch.cat([h, hs.pop()], dim=1)
@@ -1156,7 +1173,14 @@ class InferSdxlUNet2DConditionModel:
             self.ds_timesteps_2 = ds_timesteps_2 if ds_timesteps_2 is not None else 1000
             self.ds_ratio = ds_ratio
 
-    def forward(self, x, timesteps=None, context=None, y=None, **kwargs):
+    def forward(
+            self, x, 
+            timesteps=None, 
+            context=None, 
+            y=None, 
+            down_block_additional_residuals=None,
+            mid_block_additional_residual=None,
+            **kwargs):
         r"""
         current implementation is a copy of `SdxlUNet2DConditionModel.forward()` with Deep Shrink.
         """
@@ -1208,7 +1232,17 @@ class InferSdxlUNet2DConditionModel:
             h = call_module(module, h, emb, context)
             hs.append(h)
 
+        # NOTE(hyejin): skip-connection Controlnet
+        if down_block_additional_residuals is not None:
+            for i in range(len(hs)):
+                hs[i] += down_block_additional_residuals[i]
+            
+
         h = call_module(_self.middle_block, h, emb, context)
+
+        # NOTE(hyejin): skip-connection Controlnet
+        if mid_block_additional_residual is not None:
+            h += mid_block_additional_residual
 
         for module in _self.output_blocks:
             # Deep Shrink

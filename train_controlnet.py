@@ -194,7 +194,6 @@ def train(args):
             "projection_class_embeddings_input_dim": None,
         }
     unet.config = SimpleNamespace(**unet.config)
-
     controlnet = ControlNetModel.from_unet(unet)
 
     if args.controlnet_model_name_or_path:

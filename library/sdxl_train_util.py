@@ -74,7 +74,7 @@ def _load_target_model(
             vae,
             unet,
             logit_scale,
-            ckpt_info,
+            ckpt_info
         ) = sdxl_model_util.load_models_from_sdxl_checkpoint(model_version, name_or_path, device, model_dtype)
     else:
         # Diffusers model is loaded to CPU
@@ -110,6 +110,7 @@ def _load_target_model(
 
         vae = pipe.vae
         unet = pipe.unet
+
         del pipe
 
         # Diffusers U-Net to original U-Net

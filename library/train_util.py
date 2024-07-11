@@ -430,6 +430,8 @@ class DreamBoothSubset(BaseSubset):
         caption_suffix,
         token_warmup_min,
         token_warmup_step,
+        conditioning_data_dir: str = None,
+
     ) -> None:
         assert image_dir is not None, "image_dir must be specified / image_dirは指定が必須です"
 
@@ -461,6 +463,7 @@ class DreamBoothSubset(BaseSubset):
         if self.caption_extension and not self.caption_extension.startswith("."):
             self.caption_extension = "." + self.caption_extension
         self.cache_info = cache_info
+        self.conditioning_data_dir = conditioning_data_dir
 
     def __eq__(self, other) -> bool:
         if not isinstance(other, DreamBoothSubset):
@@ -491,6 +494,8 @@ class FineTuningSubset(BaseSubset):
         caption_suffix,
         token_warmup_min,
         token_warmup_step,
+        conditioning_data_dir: str = None,
+
     ) -> None:
         assert metadata_file is not None, "metadata_file must be specified / metadata_fileは指定が必須です"
 
@@ -517,6 +522,7 @@ class FineTuningSubset(BaseSubset):
         )
 
         self.metadata_file = metadata_file
+        self.conditioning_data_dir = conditioning_data_dir
 
     def __eq__(self, other) -> bool:
         if not isinstance(other, FineTuningSubset):
@@ -584,6 +590,7 @@ class ControlNetSubset(BaseSubset):
         if not isinstance(other, ControlNetSubset):
             return NotImplemented
         return self.image_dir == other.image_dir and self.conditioning_data_dir == other.conditioning_data_dir
+
 
 
 class BaseDataset(torch.utils.data.Dataset):
@@ -2007,15 +2014,14 @@ class ControlNetDataset(BaseDataset):
             crop_top_left = example["crop_top_lefts"][i]
             flipped = example["flippeds"][i]
             cond_img = load_image(image_info.cond_img_path)
-
+            # NOTE(hyejin): Controlnet image와 original image의 size 맞추기
             if self.dreambooth_dataset_delegate.enable_bucket:
-                assert (
-                    cond_img.shape[0] == original_size_hw[0] and cond_img.shape[1] == original_size_hw[1]
-                ), f"size of conditioning image is not match / 画像サイズが合いません: {image_info.absolute_path}"
+                # assert (
+                #     cond_img.shape[0] == original_size_hw[0] and cond_img.shape[1] == original_size_hw[1]
+                # ), f"size of conditioning image is not match / 画像サイズが合いません: {image_info.absolute_path}"
                 cond_img = cv2.resize(
                     cond_img, image_info.resized_size, interpolation=cv2.INTER_AREA
                 )  # INTER_AREAでやりたいのでcv2でリサイズ
-
                 # TODO support random crop
                 # 現在サポートしているcropはrandomではなく中央のみ
                 h, w = target_size_hw
